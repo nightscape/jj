@@ -55,7 +55,7 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo, '_> {
     template_builder::impl_core_wrap_property_fns!('repo, CommitTemplatePropertyKind::Core);
 
     fn build_keyword(&self, name: &str, span: pest::Span) -> TemplateParseResult<Self::Property> {
-        build_commit_keyword(self, name, span)
+        self.build_commit_keyword(name, span)
     }
 
     fn build_method(
@@ -69,7 +69,7 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo, '_> {
                 template_builder::build_core_method(self, build_ctx, property, function)
             }
             CommitTemplatePropertyKind::Commit(property) => {
-                build_commit_method(self, build_ctx, property, function)
+                self.build_commit_method(build_ctx, property, function)
             }
             CommitTemplatePropertyKind::CommitList(property) => {
                 template_builder::build_unformattable_list_method(
@@ -105,6 +105,160 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo, '_> {
 // If we need to add multiple languages that support Commit types, this can be
 // turned into a trait which extends TemplateLanguage.
 impl<'repo> CommitTemplateLanguage<'repo, '_> {
+    fn build_commit_keyword_opt(
+        &self,
+        property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
+        name: &str,
+    ) -> Option<CommitTemplatePropertyKind<'repo>> {
+        let repo = self.repo;
+        let cache = &self.keyword_cache;
+        let property = match name {
+            "description" => self.wrap_string(self.wrap_fn(property, |commit| {
+                text_util::complete_newline(commit.description())
+            })),
+            "change_id" => self.wrap_commit_or_change_id(self.wrap_fn(property, |commit| {
+                CommitOrChangeId::Change(commit.change_id().to_owned())
+            })),
+            "commit_id" => self.wrap_commit_or_change_id(self.wrap_fn(property, |commit| {
+                CommitOrChangeId::Commit(commit.id().to_owned())
+            })),
+            "parents" => self.wrap_commit_list(self.wrap_fn(property, |commit| commit.parents())),
+            "author" => {
+                self.wrap_signature(self.wrap_fn(property, |commit| commit.author().clone()))
+            }
+            "committer" => {
+                self.wrap_signature(self.wrap_fn(property, |commit| commit.committer().clone()))
+            }
+            "working_copies" => {
+                self.wrap_string(self.wrap_repo_fn(repo, property, extract_working_copies))
+            }
+            "current_working_copy" => {
+                let workspace_id = self.workspace_id.clone();
+                self.wrap_boolean(self.wrap_fn(property, move |commit| {
+                    Some(commit.id()) == repo.view().get_wc_commit_id(&workspace_id)
+                }))
+            }
+            "branches" => {
+                let index = cache.branches_index(repo).clone();
+                self.wrap_ref_name_list(self.wrap_fn(property, move |commit| {
+                    index
+                        .get(commit.id())
+                        .iter()
+                        .filter(|ref_name| ref_name.is_local() || !ref_name.synced)
+                        .cloned()
+                        .collect()
+                }))
+            }
+            "local_branches" => {
+                let index = cache.branches_index(repo).clone();
+                self.wrap_ref_name_list(self.wrap_fn(property, move |commit| {
+                    index
+                        .get(commit.id())
+                        .iter()
+                        .filter(|ref_name| ref_name.is_local())
+                        .cloned()
+                        .collect()
+                }))
+            }
+            "remote_branches" => {
+                let index = cache.branches_index(repo).clone();
+                self.wrap_ref_name_list(self.wrap_fn(property, move |commit| {
+                    index
+                        .get(commit.id())
+                        .iter()
+                        .filter(|ref_name| ref_name.is_remote())
+                        .cloned()
+                        .collect()
+                }))
+            }
+            "tags" => {
+                let index = cache.tags_index(repo).clone();
+                self.wrap_ref_name_list(
+                    self.wrap_fn(property, move |commit| index.get(commit.id()).to_vec()),
+                )
+            }
+            "git_refs" => {
+                let index = cache.git_refs_index(repo).clone();
+                self.wrap_ref_name_list(
+                    self.wrap_fn(property, move |commit| index.get(commit.id()).to_vec()),
+                )
+            }
+            "git_head" => {
+                self.wrap_ref_name_list(self.wrap_repo_fn(repo, property, extract_git_head))
+            }
+            "divergent" => self.wrap_boolean(self.wrap_fn(property, |commit| {
+                // The given commit could be hidden in e.g. obslog.
+                let maybe_entries = repo.resolve_change_id(commit.change_id());
+                maybe_entries.map_or(0, |entries| entries.len()) > 1
+            })),
+            "hidden" => self.wrap_boolean(self.wrap_fn(property, |commit| {
+                let maybe_entries = repo.resolve_change_id(commit.change_id());
+                maybe_entries.map_or(true, |entries| !entries.contains(commit.id()))
+            })),
+            "conflict" => {
+                self.wrap_boolean(self.wrap_fn(property, |commit| commit.has_conflict().unwrap()))
+            }
+            "empty" => self.wrap_boolean(self.wrap_fn(property, |commit| {
+                if let [parent] = &commit.parents()[..] {
+                    return parent.tree_id() == commit.tree_id();
+                }
+                let parent_tree = rewrite::merge_commit_trees(repo, &commit.parents()).unwrap();
+                *commit.tree_id() == parent_tree.id()
+            })),
+            "root" => self.wrap_boolean(self.wrap_fn(property, move |commit| {
+                commit.id() == repo.store().root_commit_id()
+            })),
+            _ => return None,
+        };
+        Some(property)
+    }
+
+    fn build_commit_keyword(
+        &self,
+        name: &str,
+        span: pest::Span,
+    ) -> TemplateParseResult<CommitTemplatePropertyKind<'repo>> {
+        // Commit object is lightweight (a few Arc + CommitId), so just clone it
+        // to turn into a property type. Abstraction over "for<'a> (&'a T) -> &'a T"
+        // and "(&T) -> T" wouldn't be simple. If we want to remove Clone/Rc/Arc,
+        // maybe we can add an abstraction that takes "Fn(&Commit) -> O" and returns
+        // "TemplateProperty<Commit, Output = O>".
+        let property = TemplatePropertyFn(|commit: &Commit| commit.clone());
+        self.build_commit_keyword_opt(property, name)
+            .ok_or_else(|| TemplateParseError::no_such_keyword(name, span))
+    }
+
+    fn build_commit_method(
+        &self,
+        _build_ctx: &BuildContext<CommitTemplatePropertyKind<'repo>>,
+        self_property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
+        function: &FunctionCallNode,
+    ) -> TemplateParseResult<CommitTemplatePropertyKind<'repo>> {
+        if let Some(property) = self.build_commit_keyword_opt(self_property, function.name) {
+            template_parser::expect_no_arguments(function)?;
+            Ok(property)
+        } else {
+            Err(TemplateParseError::no_such_method("Commit", function))
+        }
+    }
+
+    fn wrap_fn<O>(
+        &self,
+        property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
+        f: impl Fn(&Commit) -> O + 'repo,
+    ) -> impl TemplateProperty<Commit, Output = O> + 'repo {
+        TemplateFunction::new(property, move |commit| f(&commit))
+    }
+
+    fn wrap_repo_fn<O>(
+        &self,
+        repo: &'repo dyn Repo,
+        property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
+        f: impl Fn(&dyn Repo, &Commit) -> O + 'repo,
+    ) -> impl TemplateProperty<Commit, Output = O> + 'repo {
+        TemplateFunction::new(property, move |commit| f(repo, &commit))
+    }
+
     fn wrap_commit(
         &self,
         property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
@@ -234,153 +388,6 @@ impl CommitKeywordCache {
         self.git_refs_index
             .get_or_init(|| Rc::new(build_ref_names_index(repo.view().git_refs())))
     }
-}
-
-fn build_commit_keyword<'repo>(
-    language: &CommitTemplateLanguage<'repo, '_>,
-    name: &str,
-    span: pest::Span,
-) -> TemplateParseResult<CommitTemplatePropertyKind<'repo>> {
-    // Commit object is lightweight (a few Arc + CommitId), so just clone it
-    // to turn into a property type. Abstraction over "for<'a> (&'a T) -> &'a T"
-    // and "(&T) -> T" wouldn't be simple. If we want to remove Clone/Rc/Arc,
-    // maybe we can add an abstraction that takes "Fn(&Commit) -> O" and returns
-    // "TemplateProperty<Commit, Output = O>".
-    let property = TemplatePropertyFn(|commit: &Commit| commit.clone());
-    build_commit_keyword_opt(language, property, name)
-        .ok_or_else(|| TemplateParseError::no_such_keyword(name, span))
-}
-
-fn build_commit_method<'repo>(
-    language: &CommitTemplateLanguage<'repo, '_>,
-    _build_ctx: &BuildContext<CommitTemplatePropertyKind<'repo>>,
-    self_property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
-    function: &FunctionCallNode,
-) -> TemplateParseResult<CommitTemplatePropertyKind<'repo>> {
-    if let Some(property) = build_commit_keyword_opt(language, self_property, function.name) {
-        template_parser::expect_no_arguments(function)?;
-        Ok(property)
-    } else {
-        Err(TemplateParseError::no_such_method("Commit", function))
-    }
-}
-
-fn build_commit_keyword_opt<'repo>(
-    language: &CommitTemplateLanguage<'repo, '_>,
-    property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
-    name: &str,
-) -> Option<CommitTemplatePropertyKind<'repo>> {
-    fn wrap_fn<'repo, O>(
-        property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
-        f: impl Fn(&Commit) -> O + 'repo,
-    ) -> impl TemplateProperty<Commit, Output = O> + 'repo {
-        TemplateFunction::new(property, move |commit| f(&commit))
-    }
-    fn wrap_repo_fn<'repo, O>(
-        repo: &'repo dyn Repo,
-        property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
-        f: impl Fn(&dyn Repo, &Commit) -> O + 'repo,
-    ) -> impl TemplateProperty<Commit, Output = O> + 'repo {
-        TemplateFunction::new(property, move |commit| f(repo, &commit))
-    }
-
-    let repo = language.repo;
-    let cache = &language.keyword_cache;
-    let property = match name {
-        "description" => language.wrap_string(wrap_fn(property, |commit| {
-            text_util::complete_newline(commit.description())
-        })),
-        "change_id" => language.wrap_commit_or_change_id(wrap_fn(property, |commit| {
-            CommitOrChangeId::Change(commit.change_id().to_owned())
-        })),
-        "commit_id" => language.wrap_commit_or_change_id(wrap_fn(property, |commit| {
-            CommitOrChangeId::Commit(commit.id().to_owned())
-        })),
-        "parents" => language.wrap_commit_list(wrap_fn(property, |commit| commit.parents())),
-        "author" => language.wrap_signature(wrap_fn(property, |commit| commit.author().clone())),
-        "committer" => {
-            language.wrap_signature(wrap_fn(property, |commit| commit.committer().clone()))
-        }
-        "working_copies" => {
-            language.wrap_string(wrap_repo_fn(repo, property, extract_working_copies))
-        }
-        "current_working_copy" => {
-            let workspace_id = language.workspace_id.clone();
-            language.wrap_boolean(wrap_fn(property, move |commit| {
-                Some(commit.id()) == repo.view().get_wc_commit_id(&workspace_id)
-            }))
-        }
-        "branches" => {
-            let index = cache.branches_index(repo).clone();
-            language.wrap_ref_name_list(wrap_fn(property, move |commit| {
-                index
-                    .get(commit.id())
-                    .iter()
-                    .filter(|ref_name| ref_name.is_local() || !ref_name.synced)
-                    .cloned()
-                    .collect()
-            }))
-        }
-        "local_branches" => {
-            let index = cache.branches_index(repo).clone();
-            language.wrap_ref_name_list(wrap_fn(property, move |commit| {
-                index
-                    .get(commit.id())
-                    .iter()
-                    .filter(|ref_name| ref_name.is_local())
-                    .cloned()
-                    .collect()
-            }))
-        }
-        "remote_branches" => {
-            let index = cache.branches_index(repo).clone();
-            language.wrap_ref_name_list(wrap_fn(property, move |commit| {
-                index
-                    .get(commit.id())
-                    .iter()
-                    .filter(|ref_name| ref_name.is_remote())
-                    .cloned()
-                    .collect()
-            }))
-        }
-        "tags" => {
-            let index = cache.tags_index(repo).clone();
-            language.wrap_ref_name_list(wrap_fn(property, move |commit| {
-                index.get(commit.id()).to_vec()
-            }))
-        }
-        "git_refs" => {
-            let index = cache.git_refs_index(repo).clone();
-            language.wrap_ref_name_list(wrap_fn(property, move |commit| {
-                index.get(commit.id()).to_vec()
-            }))
-        }
-        "git_head" => language.wrap_ref_name_list(wrap_repo_fn(repo, property, extract_git_head)),
-        "divergent" => language.wrap_boolean(wrap_fn(property, |commit| {
-            // The given commit could be hidden in e.g. obslog.
-            let maybe_entries = repo.resolve_change_id(commit.change_id());
-            maybe_entries.map_or(0, |entries| entries.len()) > 1
-        })),
-        "hidden" => language.wrap_boolean(wrap_fn(property, |commit| {
-            let maybe_entries = repo.resolve_change_id(commit.change_id());
-            maybe_entries.map_or(true, |entries| !entries.contains(commit.id()))
-        })),
-        "conflict" => {
-            language.wrap_boolean(wrap_fn(property, |commit| commit.has_conflict().unwrap()))
-        }
-        "empty" => language.wrap_boolean(wrap_fn(property, |commit| {
-            if let [parent] = &commit.parents()[..] {
-                return parent.tree_id() == commit.tree_id();
-            }
-            let parent_tree = rewrite::merge_commit_trees(repo, &commit.parents()).unwrap();
-            *commit.tree_id() == parent_tree.id()
-        })),
-        "root" => language.wrap_boolean(wrap_fn(property, move |commit| {
-            commit.id() == repo.store().root_commit_id()
-        })),
-        _ => return None,
-    };
-    Some(property)
 }
 
 // TODO: return Vec<String>
