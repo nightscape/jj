@@ -16,6 +16,7 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use itertools::Itertools as _;
 use jj_lib::backend::{ChangeId, CommitId};
@@ -41,11 +42,34 @@ use crate::templater::{
 };
 use crate::text_util;
 
+/// Trait for extending the commit template language.
+pub trait CommitTemplateLanguageExtension {
+    /// Returns a new template property on successful parse.
+    /// Else, it must return `property` back as an error.
+    fn build_commit_property_opt<'repo>(
+        &self,
+        property: Box<dyn TemplateProperty<Commit, Output = Commit> + 'repo>,
+        name: &str,
+    ) -> Result<
+        CommitTemplatePropertyKind<'repo>,
+        Box<dyn TemplateProperty<Commit, Output = Commit> + 'repo>,
+    >;
+
+    /// Returns a new template property on success, or else an error.
+    fn build_commit_function<'repo>(
+        &self,
+        build_ctx: &BuildContext<CommitTemplatePropertyKind<'repo>>,
+        self_property: Box<dyn TemplateProperty<Commit, Output = Commit> + 'repo>,
+        function: &FunctionCallNode,
+    ) -> TemplateParseResult<CommitTemplatePropertyKind<'repo>>;
+}
+
 struct CommitTemplateLanguage<'repo, 'b> {
     repo: &'repo dyn Repo,
     workspace_id: &'b WorkspaceId,
     id_prefix_context: &'repo IdPrefixContext,
     keyword_cache: CommitKeywordCache,
+    extension: Option<Arc<dyn CommitTemplateLanguageExtension>>,
 }
 
 impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo, '_> {
@@ -109,7 +133,10 @@ impl<'repo> CommitTemplateLanguage<'repo, '_> {
         &self,
         property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
         name: &str,
-    ) -> Option<CommitTemplatePropertyKind<'repo>> {
+    ) -> Result<
+        CommitTemplatePropertyKind<'repo>,
+        Box<dyn TemplateProperty<Commit, Output = Commit> + 'repo>,
+    > {
         let repo = self.repo;
         let cache = &self.keyword_cache;
         let property = match name {
@@ -208,9 +235,15 @@ impl<'repo> CommitTemplateLanguage<'repo, '_> {
             "root" => self.wrap_boolean(self.wrap_fn(property, move |commit| {
                 commit.id() == repo.store().root_commit_id()
             })),
-            _ => return None,
+            _ => {
+                if let Some(ext) = &self.extension {
+                    return ext.build_commit_property_opt(Box::new(property), name);
+                } else {
+                    return Err(Box::new(property));
+                }
+            }
         };
-        Some(property)
+        Ok(property)
     }
 
     fn build_commit_keyword(
@@ -225,20 +258,27 @@ impl<'repo> CommitTemplateLanguage<'repo, '_> {
         // "TemplateProperty<Commit, Output = O>".
         let property = TemplatePropertyFn(|commit: &Commit| commit.clone());
         self.build_commit_keyword_opt(property, name)
-            .ok_or_else(|| TemplateParseError::no_such_keyword(name, span))
+            .map_err(|_| TemplateParseError::no_such_keyword(name, span))
     }
 
     fn build_commit_method(
         &self,
-        _build_ctx: &BuildContext<CommitTemplatePropertyKind<'repo>>,
+        build_ctx: &BuildContext<CommitTemplatePropertyKind<'repo>>,
         self_property: impl TemplateProperty<Commit, Output = Commit> + 'repo,
         function: &FunctionCallNode,
     ) -> TemplateParseResult<CommitTemplatePropertyKind<'repo>> {
-        if let Some(property) = self.build_commit_keyword_opt(self_property, function.name) {
-            template_parser::expect_no_arguments(function)?;
-            Ok(property)
-        } else {
-            Err(TemplateParseError::no_such_method("Commit", function))
+        match self.build_commit_keyword_opt(self_property, function.name) {
+            Ok(property) => {
+                template_parser::expect_no_arguments(function)?;
+                Ok(property)
+            }
+            Err(property) => {
+                if let Some(ext) = &self.extension {
+                    ext.build_commit_function(build_ctx, property, function)
+                } else {
+                    Err(TemplateParseError::no_such_method("Commit", function))
+                }
+            }
         }
     }
 
@@ -302,7 +342,7 @@ impl<'repo> CommitTemplateLanguage<'repo, '_> {
     }
 }
 
-enum CommitTemplatePropertyKind<'repo> {
+pub enum CommitTemplatePropertyKind<'repo> {
     Core(CoreTemplatePropertyKind<'repo, Commit>),
     Commit(Box<dyn TemplateProperty<Commit, Output = Commit> + 'repo>),
     CommitList(Box<dyn TemplateProperty<Commit, Output = Vec<Commit>> + 'repo>),
@@ -407,7 +447,7 @@ fn extract_working_copies(repo: &dyn Repo, commit: &Commit) -> String {
 
 /// Branch or tag name with metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RefName {
+pub struct RefName {
     /// Local name.
     name: String,
     /// Remote name if this is a remote or Git-tracking ref.
@@ -563,7 +603,7 @@ fn extract_git_head(repo: &dyn Repo, commit: &Commit) -> Vec<RefName> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CommitOrChangeId {
+pub enum CommitOrChangeId {
     Commit(CommitId),
     Change(ChangeId),
 }
@@ -655,7 +695,7 @@ fn build_commit_or_change_id_method<'repo>(
     Ok(property)
 }
 
-struct ShortestIdPrefix {
+pub struct ShortestIdPrefix {
     pub prefix: String,
     pub rest: String,
 }
@@ -723,12 +763,14 @@ pub fn parse<'repo>(
     id_prefix_context: &'repo IdPrefixContext,
     template_text: &str,
     aliases_map: &TemplateAliasesMap,
+    extension: Option<Arc<dyn CommitTemplateLanguageExtension>>,
 ) -> TemplateParseResult<Box<dyn Template<Commit> + 'repo>> {
     let language = CommitTemplateLanguage {
         repo,
         workspace_id,
         id_prefix_context,
         keyword_cache: CommitKeywordCache::default(),
+        extension,
     };
     let node = template_parser::parse(template_text, aliases_map)?;
     template_builder::build(&language, &node)
